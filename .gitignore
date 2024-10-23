@@ -3,3 +3,6 @@ cache/
 __pycache__/
 __pycache__/split_by_llm.cpython-310.pyc
 .env
+main1.py
+prompt.txt
+.gitignore

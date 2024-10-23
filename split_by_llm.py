@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 from typing import List, Optional
 import openai
 from dotenv import load_dotenv

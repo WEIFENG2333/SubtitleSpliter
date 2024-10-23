@@ -5,10 +5,14 @@ from ASRData import ASRData, from_srt, ASRDataSeg
 import difflib
 from typing import List
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from split_by_llm import split_by_llm
 
 MAX_WORD_COUNT = 16  # 英文单词或中文字符的最大数量
+SEGMENT_THRESHOLD = 1000  # 每个分段的最大字数
+FIXED_NUM_THREADS = 4  # 固定的线程数量
+SPLIT_RANGE = 30  # 在分割点前后寻找最大时间间隔的范围
 
 
 def is_pure_punctuation(s: str) -> bool:
@@ -144,20 +148,91 @@ def split_long_segment(merged_text: str, segs_to_merge: List[ASRDataSeg]) -> Lis
     first_text = ''.join(seg.text for seg in first_segs)
     second_text = ''.join(seg.text for seg in second_segs)
 
-    # 必要时递归拆分
+    # 递归拆分
     result_segs.extend(split_long_segment(first_text, first_segs))
     result_segs.extend(split_long_segment(second_text, second_segs))
 
     return result_segs
 
 
-if __name__ == '__main__':
+def process_split_by_llm(asr_data_part: ASRData) -> List[str]:
+    """
+    调用 split_by_llm 处理单个 ASRData 分段，返回句子列表
+    """
+    txt = asr_data_part.to_txt().replace("\n", "")
+    sentences = split_by_llm(txt, use_cache=True)
+    return sentences
+
+
+def split_asr_data(asr_data: ASRData, num_segments: int) -> List[ASRData]:
+    """
+    根据ASR分段中的时间间隔，将ASRData拆分成多个部分。
+    处理步骤：
+    1. 计算总字数，并确定每个分段的字数范围。
+    2. 确定平均分割点。
+    3. 在分割点前后一定范围内，寻找时间间隔最大的点作为实际的分割点。
+    """
+    total_segs = len(asr_data.segments)
+    total_word_count = count_words(asr_data.to_txt())
+    words_per_segment = total_word_count // num_segments
+    split_indices = []
+
+    if num_segments <= 1 or total_segs <= num_segments:
+        return [asr_data]
+
+    # 计算每个分段的大致字数 根据每段字数计算分割点
+    split_indices = [i * words_per_segment for i in range(1, num_segments)]
+    # 调整分割点：在每个平均分割点附近寻找时间间隔最大的点
+    adjusted_split_indices = []
+    for split_point in split_indices:
+        # 定义搜索范围
+        start = max(0, split_point - SPLIT_RANGE)
+        end = min(total_segs - 1, split_point + SPLIT_RANGE)
+        # 在范围内找到时间间隔最大的点
+        max_gap = -1
+        best_index = split_point
+        for j in range(start, end):
+            gap = asr_data.segments[j + 1].start_time - asr_data.segments[j].end_time
+            if gap > max_gap:
+                max_gap = gap
+                best_index = j
+        adjusted_split_indices.append(best_index)
+
+    # 移除重复的分割点
+    adjusted_split_indices = sorted(list(set(adjusted_split_indices)))
+
+    # 根据调整后的分割点拆分ASRData
+    segments = []
+    prev_index = 0
+    for index in adjusted_split_indices:
+        part = ASRData(asr_data.segments[prev_index:index + 1])
+        segments.append(part)
+        prev_index = index + 1
+    # 添加最后一部分
+    if prev_index < total_segs:
+        part = ASRData(asr_data.segments[prev_index:])
+        segments.append(part)
+
+    return segments
+
+
+def determine_num_segments(word_count: int, threshold: int = 1000) -> int:
+    """
+    根据字数计算分段数，每1000个字为一个分段，至少为1
+    """
+    num_segments = word_count // threshold
+    # 如果存在余数，增加一个分段
+    if word_count % threshold > 0:
+        num_segments += 1
+    return max(1, num_segments)
+
+
+def main(srt_path: str, save_path: str, num_threads: int = FIXED_NUM_THREADS):
     # 从SRT文件加载ASR数据
-    srt_path = "test_data/yidali.srt"
     with open(srt_path, encoding="utf-8") as f:
         asr_data = from_srt(f.read())
 
-    # 处理英文（小写且加空格）和标点符号（删除）
+    # 预处理ASR数据，去除标点并转换为小写
     new_segments = []
     for seg in asr_data.segments:
         if not is_pure_punctuation(seg.text):
@@ -168,16 +243,56 @@ if __name__ == '__main__':
 
     # 获取连接后的文本
     txt = asr_data.to_txt().replace("\n", "")
-    print(txt)
+    total_word_count = count_words(txt)
+    print(f"[+] 合并后的文本长度: {total_word_count} 字")
 
-    # 使用LLM将文本拆分为句子
-    print("[+] 正在请求LLM将文本拆分为句子...")
-    sentences = split_by_llm(txt, use_cache=True)
+    # 确定分段数
+    num_segments = determine_num_segments(total_word_count, threshold=SEGMENT_THRESHOLD)
+    print(f"[+] 根据字数 {total_word_count}，确定分段数: {num_segments}")
+
+    # 分割ASRData
+    asr_data_segments = split_asr_data(asr_data, num_segments)
+
+    # for i in asr_data_segments:
+    #     print(len(i.segments))
+        # print(i.to_txt().split("\n"))
+
+    # 多线程执行 split_by_llm 获取句子列表
+    print("[+] 正在并行请求LLM将每个分段的文本拆分为句子...")
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        def process_segment(asr_data_part):
+            txt = asr_data_part.to_txt().replace("\n", "")
+            sentences = split_by_llm(txt, use_cache=True)
+            print(f"[+] 分段的句子提取完成，共 {len(sentences)} 句")
+            return sentences
+        all_sentences = list(executor.map(process_segment, asr_data_segments))
+    all_sentences = [item for sublist in all_sentences for item in sublist]
+    
+    print(f"[+] 总共提取到 {len(all_sentences)} 句")
 
     # 基于LLM已经分段的句子，对ASR分段进行合并
-    new_asr_data = merge_segments_based_on_sentences(asr_data, sentences)
+    print("[+] 正在合并ASR分段基于句子列表...")
+    merged_asr_data = merge_segments_based_on_sentences(asr_data, all_sentences)
+
+    # 按开始时间排序合并后的分段(其实好像不需要)
+    merged_asr_data.segments.sort(key=lambda seg: seg.start_time)
+    final_asr_data = ASRData(merged_asr_data.segments)
 
     # 保存到SRT文件
-    new_srt_path = srt_path.replace(".srt", "_merged.srt")
-    new_asr_data.to_srt(save_path=new_srt_path)
+    final_asr_data.to_srt(save_path=save_path)
+    print(f"[+] 已保存合并后的SRT文件: {save_path}")
 
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description="优化ASR分段处理脚本")
+    parser.add_argument('--srt_path', type=str, required=True, help='输入的SRT文件路径')
+    parser.add_argument('--save_path', type=str, required=True, help='输入的SRT文件路径')
+    parser.add_argument('--num_threads', type=int, default=FIXED_NUM_THREADS, help='线程数量')
+    args = parser.parse_args()
+
+    # args.srt_path = "test_data/java.srt"
+    # args.save_path = args.srt_path.replace(".srt", "_merged.srt")
+
+    main(srt_path=args.srt_path, save_path=args.save_path, num_threads=args.num_threads)
