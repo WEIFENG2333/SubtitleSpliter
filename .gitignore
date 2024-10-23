@@ -1,3 +1,5 @@
 cache/
 .vscode/
 __pycache__/
+__pycache__/split_by_llm.cpython-310.pyc
+.env

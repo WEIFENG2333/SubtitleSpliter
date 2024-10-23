@@ -1,14 +1,18 @@
-import re
-import os
-import json
 import hashlib
+import json
+import os
+from typing import List, Optional
 import openai
-from typing import Optional, List
+from dotenv import load_dotenv
 
-# 配置环境变量
-os.environ['OPENAI_BASE_URL'] = "https://api.ephone.chat/v1"
-os.environ["OPENAI_API_KEY"] = "msuqsbr4Ano2cV1GDk0AIaUS1MXS3vukQF0eI7Cble8CgF7Q"
+# 加载.env文件
+load_dotenv()
 
+# 使用环境变量
+os.environ['OPENAI_BASE_URL'] = os.getenv('OPENAI_BASE_URL')
+os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
+
+# ... 其余代码保持不变 ...
 # 常量定义
 MODEL = "gpt-4o-mini"
 CACHE_DIR = "cache"
